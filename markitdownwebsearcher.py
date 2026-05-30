@@ -1,8 +1,25 @@
 #!/usr/bin/env python3
 """
-Deep Search MCP Server (Version 15.0)
+Deep Search MCP Server (Version 16.0)
 Local-first JSON-RPC stdio search tool with IP-pinned SSRF-hardened fetch,
 streaming byte ceiling, cross-encoder reranking, and honest token accounting.
+
+v16 changes (all in the RETRIEVAL / RANKING / OUTPUT strategy; the fetcher,
+SSRF hardening, redirect logic, and token accounting are unchanged):
+
+  A. Paginated index accumulator (SearXNG) with three termination guards
+     (target distinct domains / max pages / stall-break) and conservative,
+     pre-fetch URL normalization that dedups before spinning up fetch workers.
+  B. Sliding-window segmentation shifted to step=1 (2-sentence overlap) to keep
+     figures glued to their qualifying clauses. No `len-2` tail truncation.
+  C. Hybrid-Coverage reranker: cross-encoder demoted from gatekeeper to
+     high-signal noise filter. Relative floor (top_prob - 0.60) PLUS a small
+     absolute floor so the junk filter still bites on hard queries. `break`
+     only on the floor; `continue` on domain-cap and dedup. Pool right-sized
+     to 120 to balance the 3x segment growth from step=1.
+  D. Dual-source chronological sort: engine-provided date (preferred) with a
+     trafilatura bare_extraction scraped-date fallback, bound to each segment,
+     sorted newest-first with undated entries trailing gracefully.
 
 Scope note: intended for single-user, local-first desktop use (Claude Desktop,
 Cursor, Windsurf). The fetch path validates resolved IPs and pins the connection
@@ -16,26 +33,55 @@ import re
 import socket
 import math
 import ipaddress
+import datetime as dt
 import tiktoken
-from urllib.parse import quote_plus, urlparse, parse_qs, urljoin
+from urllib.parse import (quote_plus, urlparse, parse_qs, urljoin,
+                          urlencode, urlunparse)
 from bs4 import BeautifulSoup
 import trafilatura
 from urllib3.poolmanager import PoolManager
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ======================================================================
 # GLOBAL CONFIGURATION
 # ======================================================================
-MAX_INDEX_LINKS = 20     #change it to 4,if needed
-MAX_CANDIDATES_POOL = 120
-MAX_PAGE_SIZE_BYTES = 512 * 1024        # Hard byte ceiling, enforced during streaming
-MAX_RESULTS = 20                         # Final excerpts returned
+MAX_PAGE_SIZE_BYTES = 2 * 1024 * 1024    # 2 MB ceiling: captures any real article,
+                                         # keeps memory predictable under 8 workers.
 MAX_REDIRECT_HOPS = 3
-PROBABILITY_CUTOFF_MARGIN = 0.40        # Keep chunks within 0.15 of top probability
-JACCARD_DEDUP_THRESHOLD = 0.35
-DEDUP_MIN_LEN = 180                     # Only dedup long narrative blocks
 FETCH_TIMEOUT = 5.0
 TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+
+# --- (A) Paginated index accumulator ---------------------------------
+SEARXNG_URL = "http://localhost:8080/search"   # local trusted backend
+TARGET_DISTINCT_DOMAINS = 50     # the "top 50 latest websites" goal
+MAX_PAGES_TO_ACCUMULATE = 10     # hard ceiling on pagination depth
+SEARXNG_CATEGORIES = "general,news"   # news engines populate dates + time_range
+SEARXNG_TIME_RANGE = "month"     # recency bias; "" disables (see dual-pass note)
+DUAL_PASS_RECENCY = True         # run one time-filtered + one unfiltered pass
+
+# --- (C) Reranker (Hybrid-Coverage Mode) -----------------------------
+MAX_CANDIDATES_POOL = 120        # right-sized for step=1's ~3x segment growth
+MAX_RESULTS = 50                 # final excerpts returned (one per domain target)
+RELATIVE_CUTOFF_MARGIN = 0.60    # keep chunks within 0.60 of the top probability
+ABSOLUTE_PROB_FLOOR = 0.05       # hard junk floor; bites even when query matches poorly
+JACCARD_DEDUP_THRESHOLD = 0.35
+DEDUP_MIN_LEN = 180              # only dedup long narrative blocks
+MAX_PER_DOMAIN = 1               # one excerpt per site -> 50 distinct websites
+
+# --- Fetch concurrency ------------------------------------------------
+MAX_FETCH_WORKERS = 8
+
+# Tracking params stripped during normalization. Whitelist (remove ONLY these)
+# rather than blanket-stripping the query string, since some sites encode the
+# article id in a query param (?id=, ?p=, ?story=).
+TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_reader", "utm_name", "utm_social", "utm_brand",
+    "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid",
+    "igshid", "ref", "ref_src", "ref_url", "_hsenc", "_hsmi",
+    "yclid", "twclid", "wt_mc", "spm",
+}
 
 # Initialize models globally (blocks the stdio thread during inference;
 # acceptable for single-user desktop use).
@@ -48,7 +94,7 @@ except Exception as e:
     sys.exit(1)
 
 # ======================================================================
-# SECURITY & FETCH ENGINE
+# SECURITY & FETCH ENGINE  (UNCHANGED from v15)
 # ======================================================================
 
 def resolve_and_verify_ip(hostname: str) -> str:
@@ -123,7 +169,7 @@ def execute_hardened_fetch(target_url: str) -> str:
             pool = PoolManager(**pm_kwargs)
 
             headers = {
-                "User-Agent": "Mozilla/5.0 (ContextDistiller/15.0)",
+                "User-Agent": "Mozilla/5.0 (ContextDistiller/16.0)",
                 "Host": host,
             }
 
@@ -170,26 +216,210 @@ def execute_hardened_fetch(target_url: str) -> str:
           file=sys.stderr)
     return None
 
+# ======================================================================
+# (A) PAGINATED INDEX ACCUMULATOR + URL NORMALIZATION
+# ======================================================================
 
-def fetch_organic_index(query: str):
-    """Retrieve result URLs via the DuckDuckGo HTML endpoint, decoding uddg redirects."""
+def normalize_url(url: str) -> str:
+    """
+    Conservative pre-fetch normalization for dedup:
+      - lowercase scheme + host
+      - drop fragment
+      - drop trailing slash on the path
+      - remove ONLY whitelisted tracking params (keep id-bearing params)
+    Distinct articles that differ only by id-bearing query params are preserved.
+    """
+    try:
+        p = urlparse(url)
+    except Exception:
+        return url
+    if p.scheme not in ("http", "https"):
+        return url
+
+    scheme = p.scheme.lower()
+    host = (p.hostname or "").lower()
+    netloc = host
+    if p.port:
+        netloc = f"{host}:{p.port}"
+
+    path = p.path or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+
+    kept = [(k, v) for (k, v) in parse_qs(p.query, keep_blank_values=True).items()
+            if k.lower() not in TRACKING_PARAMS]
+    # parse_qs returns lists; flatten deterministically for a stable key.
+    flat = []
+    for k, vals in sorted(kept):
+        for v in vals:
+            flat.append((k, v))
+    query = urlencode(flat)
+
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def _domain_of(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _parse_engine_date(raw):
+    """
+    Normalize a SearXNG publishedDate (ISO-ish string) to a tz-aware UTC datetime.
+    Returns None if absent/unparseable.
+    """
+    if not raw:
+        return None
+    if isinstance(raw, dt.datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=dt.timezone.utc)
+    s = str(raw).strip()
+    if not s:
+        return None
+    # Handle trailing 'Z' (Zulu) which fromisoformat historically rejects.
+    s = s.replace("Z", "+00:00")
+    try:
+        d = dt.datetime.fromisoformat(s)
+        return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return dt.datetime.strptime(s[:len(fmt) + 4], fmt).replace(
+                tzinfo=dt.timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _searxng_page(query, pageno, time_range):
+    """Fetch ONE SearXNG JSON page. Returns the raw results list (may be empty)."""
+    try:
+        import requests
+        params = {
+            "q": query,
+            "format": "json",
+            "categories": SEARXNG_CATEGORIES,
+            "pageno": pageno,
+        }
+        if time_range:
+            params["time_range"] = time_range
+        resp = requests.get(
+            SEARXNG_URL,
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0 (ContextDistiller/16.0)"},
+            timeout=FETCH_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            print(f"SEARXNG: non-200 status {resp.status_code} (page {pageno})",
+                  file=sys.stderr)
+            return []
+        return resp.json().get("results", []) or []
+    except Exception as ex:
+        print(f"SEARXNG ERROR (page {pageno}): {type(ex).__name__}: {ex}",
+              file=sys.stderr)
+        return []
+
+
+def _accumulate_pass(query, time_range, seen_norm, seen_domains, url_records):
+    """
+    Run one paginated pass (A). Mutates seen_norm / seen_domains / url_records
+    in place. Three termination guards: target domains, max pages, stall-break.
+    """
+    for pageno in range(1, MAX_PAGES_TO_ACCUMULATE + 1):
+        if len(seen_domains) >= TARGET_DISTINCT_DOMAINS:
+            break
+
+        results = _searxng_page(query, pageno, time_range)
+        if not results:
+            # empty page -> nothing more to accumulate from this pass
+            break
+
+        added_this_page = 0
+        for r in results:
+            raw_url = r.get("url")
+            if not raw_url:
+                continue
+            norm = normalize_url(raw_url)
+            if norm in seen_norm:
+                continue          # URL dedup BEFORE fetching (the normalization win)
+            seen_norm.add(norm)
+            added_this_page += 1
+
+            domain = _domain_of(norm)
+            seen_domains.add(domain)
+            url_records.append({
+                "url": raw_url,                       # fetch the original URL
+                "domain": domain,
+                "engine_date": _parse_engine_date(r.get("publishedDate")),
+            })
+
+        # Stall-break: a full page that added zero new unique URLs -> stop.
+        if added_this_page == 0:
+            print(f"STALL-BREAK: page {pageno} added 0 new URLs (tr={time_range!r}).",
+                  file=sys.stderr)
+            break
+
+
+def fetch_searxng_index(query: str):
+    """
+    (A) Primary index: local SearXNG, paginated accumulator with dual recency pass.
+    Returns a list of url_record dicts: {url, domain, engine_date}.
+    """
+    seen_norm = set()
+    seen_domains = set()
+    url_records = []
+
+    # Pass 1: recency-biased (time_range). News engines honor this; others are
+    # silently dropped by SearXNG, which is why pass 2 exists.
+    _accumulate_pass(query, SEARXNG_TIME_RANGE, seen_norm, seen_domains, url_records)
+
+    # Pass 2: unfiltered, to backfill evergreen/background sources and any
+    # engines that don't support time_range. Merged into the same dedup sets.
+    if DUAL_PASS_RECENCY and len(seen_domains) < TARGET_DISTINCT_DOMAINS:
+        _accumulate_pass(query, "", seen_norm, seen_domains, url_records)
+
+    return url_records
+
+
+def fetch_ddg_index(query: str):
+    """Fallback index source: DuckDuckGo HTML endpoint via the hardened fetch."""
     html_raw = execute_hardened_fetch(
         f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     )
     if not html_raw:
         return []
     soup = BeautifulSoup(html_raw, "html.parser")
-    links = []
+    seen_norm = set()
+    records = []
     for node in soup.select("a.result__url"):
         href = node.get("href", "")
         if "/l/?uddg=" in href:
             target = parse_qs(urlparse(href).query).get("uddg", [None])[0]
             if target:
-                links.append(target)
-    return links[:MAX_INDEX_LINKS]
+                norm = normalize_url(target)
+                if norm in seen_norm:
+                    continue
+                seen_norm.add(norm)
+                records.append({"url": target,
+                                "domain": _domain_of(target),
+                                "engine_date": None})  # DDG HTML gives no date
+        if len(records) >= TARGET_DISTINCT_DOMAINS:
+            break
+    return records
+
+
+def fetch_organic_index(query: str):
+    """SearXNG primary (paginated), DuckDuckGo fallback. Returns url_records."""
+    records = fetch_searxng_index(query)
+    if records:
+        return records
+    print("SEARXNG returned no links; using DDG fallback.", file=sys.stderr)
+    return fetch_ddg_index(query)
 
 # ======================================================================
-# PROCESSING & RERANKING
+# (B + D) PROCESSING, SEGMENTATION, DATE CAPTURE
 # ======================================================================
 
 def compute_jaccard_overlap(a: str, b: str) -> float:
@@ -200,35 +430,82 @@ def compute_jaccard_overlap(a: str, b: str) -> float:
     return len(w1 & w2) / len(w1 | w2)
 
 
-def process_and_segment(html_data, url):
-    """Sliding-window sentence segmentation (3 sentences, step 2 -> 1 overlap)."""
+def _scraped_date(html_data):
+    """
+    (D) Fallback date from the page itself via trafilatura bare_extraction
+    (plain extract() discards metadata). Returns tz-aware UTC datetime or None.
+    """
+    try:
+        meta = trafilatura.bare_extraction(html_data, with_metadata=True)
+    except Exception:
+        return None
+    if not meta:
+        return None
+    raw = meta.get("date") if isinstance(meta, dict) else getattr(meta, "date", None)
+    return _parse_engine_date(raw)
+
+
+def process_and_segment(html_data, record):
+    """
+    (B) Sliding-window segmentation, step=1 -> 2-sentence overlap, no len-2
+    tail truncation (the slice shortens naturally at the end).
+    (D) Binds the resolved date (engine preferred, scraped fallback) to each
+    segment so the output can be sorted newest-first.
+    """
     if not html_data:
         return []
     text = trafilatura.extract(html_data)
     if not text:
         return []
+
+    # Resolve date: prefer the cleaner engine date, fall back to scraped.
+    resolved_date = record.get("engine_date") or _scraped_date(html_data)
+
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s) > 20]
     segments = []
-    for i in range(0, len(sentences), 2):
+    # step=1: 2-sentence overlap. Range over the full length; the final slices
+    # sentences[i:i+3] truncate gracefully, so no closing content is dropped.
+    for i in range(0, len(sentences), 1):
         chunk = " ".join(sentences[i:i + 3])
         if len(chunk) > 130:
-            segments.append({"url": url, "clean_text": chunk})
+            segments.append({
+                "url": record["url"],
+                "domain": record["domain"],
+                "date": resolved_date,           # may be None -> trails in sort
+                "clean_text": chunk,
+            })
     return segments
 
+# ======================================================================
+# (C) RETRIEVAL + HYBRID-COVERAGE RERANKER
+# ======================================================================
 
 def run_deep_search_retrieval(query: str) -> str:
-    urls = fetch_organic_index(query)
-    if not urls:
+    records = fetch_organic_index(query)
+    if not records:
         return "ERROR: Search layer could not resolve any result links."
 
     raw_pool = []
-    for link in urls:
-        raw_pool.extend(process_and_segment(execute_hardened_fetch(link), link))
+    # Concurrent fetch; execute_hardened_fetch is self-contained per URL
+    # (own PoolManager, no shared state), so it is thread-safe. Parsing /
+    # segmentation runs back on the main thread as each fetch completes.
+    with ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as executor:
+        future_to_rec = {executor.submit(execute_hardened_fetch, rec["url"]): rec
+                         for rec in records}
+        for future in as_completed(future_to_rec):
+            rec = future_to_rec[future]
+            try:
+                html = future.result()
+            except Exception as ex:
+                print(f"FETCH WORKER ERROR for '{rec['url']}': "
+                      f"{type(ex).__name__}: {ex}", file=sys.stderr)
+                continue
+            raw_pool.extend(process_and_segment(html, rec))
 
     if not raw_pool:
         return "ERROR: No usable text content was extracted from result pages."
 
-    # Stage 1: Bi-encoder pre-filter
+    # Stage 1: Bi-encoder pre-filter into the right-sized candidate pool.
     query_vec = bi_encoder.encode(query, convert_to_tensor=True)
     texts = [c["clean_text"] for c in raw_pool]
     chunk_vecs = bi_encoder.encode(texts, convert_to_tensor=True)
@@ -238,7 +515,7 @@ def run_deep_search_retrieval(query: str) -> str:
     raw_pool.sort(key=lambda x: x["bi_score"], reverse=True)
     top_candidates = raw_pool[:MAX_CANDIDATES_POOL]
 
-    # Stage 2: Cross-encoder rerank -> sigmoid (overflow-guarded)
+    # Stage 2: Cross-encoder rerank -> sigmoid (overflow-guarded).
     pairs = [[query, c["clean_text"]] for c in top_candidates]
     logits = cross_encoder.predict(pairs)
     for i, logit in enumerate(logits):
@@ -249,31 +526,54 @@ def run_deep_search_retrieval(query: str) -> str:
         top_candidates[i]["prob"] = prob
     top_candidates.sort(key=lambda x: x["prob"], reverse=True)
 
-    # Stage 3: Relative slicing + Jaccard dedup on long blocks
-    probability_floor = max(0.0, top_candidates[0]["prob"] - PROBABILITY_CUTOFF_MARGIN)
+    # Stage 3: Hybrid-Coverage selection.
+    #   - relative floor (top - margin) AND a small absolute floor so the
+    #     junk filter still bites when the whole query matches poorly,
+    #   - `break` ONLY on the floor (list is sorted desc; nothing better follows),
+    #   - `continue` on domain-cap and dedup (never terminate the loop on them).
+    top_prob = top_candidates[0]["prob"]
+    relative_floor = max(0.0, top_prob - RELATIVE_CUTOFF_MARGIN)
+    effective_floor = max(relative_floor, ABSOLUTE_PROB_FLOOR)
+
     selected = []
     dedup_registry = []
+    domain_counts = {}
     for item in top_candidates:
-        if item["prob"] < probability_floor:
+        # Floor first: sorted descending, so once we drop below, we stop.
+        if item["prob"] < effective_floor:
             break
+
+        domain = item["domain"]
+        if domain_counts.get(domain, 0) >= MAX_PER_DOMAIN:
+            continue
+
         is_duplicate = False
         if len(item["clean_text"]) > DEDUP_MIN_LEN:
             for chosen in dedup_registry:
                 if compute_jaccard_overlap(item["clean_text"], chosen) > JACCARD_DEDUP_THRESHOLD:
                     is_duplicate = True
                     break
-        if not is_duplicate:
-            selected.append(item)
-            dedup_registry.append(item["clean_text"])
+        if is_duplicate:
+            continue
+
+        selected.append(item)
+        dedup_registry.append(item["clean_text"])
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
         if len(selected) >= MAX_RESULTS:
             break
 
     if not selected:
-        return "ERROR: No matches met the relative confidence margin."
+        return "ERROR: No matches met the confidence floor."
 
-    body_lines = ["# Search Results\n"]
+    # (D) Chronological sort: newest-first, undated entries trail. Use a fixed
+    # epoch sentinel (not None) so the sort key never mixes None with datetimes.
+    EPOCH = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    selected.sort(key=lambda x: x["date"] or EPOCH, reverse=True)
+
+    body_lines = ["# Search Results (newest-first)\n"]
     for item in selected:
-        body_lines.append(f"### {item['url']}\n{item['clean_text']}\n")
+        date_str = item["date"].date().isoformat() if item["date"] else "undated"
+        body_lines.append(f"### {item['url']}\n*({date_str})* {item['clean_text']}\n")
     final_text = "\n".join(body_lines)
 
     # Honest token accounting: report the actual distilled token count and the
@@ -289,12 +589,13 @@ def run_deep_search_retrieval(query: str) -> str:
         ratio_line = "- Raw extraction token count unavailable."
 
     final_text += ("\n\n---\n**Token Report**\n"
+                   f"- Distinct sources returned: {len(selected)}\n"
                    f"- Output tokens: {distilled_tokens}\n"
                    f"{ratio_line}")
     return final_text
 
 # ======================================================================
-# JSON-RPC 2.0 STDIO LOOP
+# JSON-RPC 2.0 STDIO LOOP  (UNCHANGED from v15)
 # ======================================================================
 
 def serialize_and_emit(msg):
@@ -338,7 +639,7 @@ def main():
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "DeepSearch", "version": "15.0.0"},
+                        "serverInfo": {"name": "DeepSearch", "version": "16.0.0"},
                     },
                 })
 
@@ -348,8 +649,9 @@ def main():
                     "result": {
                         "tools": [{
                             "name": "deep_search",
-                            "description": "Local deep search with IP-pinned fetch, "
-                                           "cross-encoder reranking, and token-trimmed output.",
+                            "description": "Local deep search: paginated multi-engine "
+                                           "retrieval (top distinct domains), cross-encoder "
+                                           "noise-filtering, newest-first chronological output.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
