@@ -46,28 +46,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ======================================================================
 # GLOBAL CONFIGURATION
 # ======================================================================
-MAX_PAGE_SIZE_BYTES = 2 * 1024 * 1024    # 2 MB ceiling: captures any real article,
+MAX_PAGE_SIZE_BYTES = 5 * 1024 * 1024    # 2 MB ceiling: captures any real article,
                                          # keeps memory predictable under 8 workers.
 MAX_REDIRECT_HOPS = 3
-FETCH_TIMEOUT = 5.0
+FETCH_TIMEOUT = 12.0
 TOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
 
 # --- (A) Paginated index accumulator ---------------------------------
 SEARXNG_URL = "http://localhost:8080/search"   # local trusted backend
-TARGET_DISTINCT_DOMAINS = 50     # the "top 50 latest websites" goal
-MAX_PAGES_TO_ACCUMULATE = 10     # hard ceiling on pagination depth
+TARGET_DISTINCT_DOMAINS = 90     # the "top 90 latest websites" goal
+MAX_PAGES_TO_ACCUMULATE = 20     # hard ceiling on pagination depth
 SEARXNG_CATEGORIES = "general,news"   # news engines populate dates + time_range
 SEARXNG_TIME_RANGE = "month"     # recency bias; "" disables (see dual-pass note)
 DUAL_PASS_RECENCY = True         # run one time-filtered + one unfiltered pass
 
 # --- (C) Reranker (Hybrid-Coverage Mode) -----------------------------
-MAX_CANDIDATES_POOL = 120        # right-sized for step=1's ~3x segment growth
-MAX_RESULTS = 50                 # final excerpts returned (one per domain target)
-RELATIVE_CUTOFF_MARGIN = 0.60    # keep chunks within 0.60 of the top probability
+MAX_CANDIDATES_POOL = 200        # right-sized for step=1's ~3x segment growth
+MAX_RESULTS = 80                 # final excerpts returned (one per domain target)
+RELATIVE_CUTOFF_MARGIN = 0.90    # keep chunks within 0.90 of the top probability
 ABSOLUTE_PROB_FLOOR = 0.05       # hard junk floor; bites even when query matches poorly
 JACCARD_DEDUP_THRESHOLD = 0.35
 DEDUP_MIN_LEN = 180              # only dedup long narrative blocks
-MAX_PER_DOMAIN = 1               # one excerpt per site -> 50 distinct websites
+MAX_PER_DOMAIN = 2               # one excerpt per site -> 50 distinct websites
 
 # --- Fetch concurrency ------------------------------------------------
 MAX_FETCH_WORKERS = 8
@@ -169,8 +169,12 @@ def execute_hardened_fetch(target_url: str) -> str:
             pool = PoolManager(**pm_kwargs)
 
             headers = {
-                "User-Agent": "Mozilla/5.0 (ContextDistiller/16.0)",
-                "Host": host,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Host": host,
             }
 
             resp = pool.request(
@@ -444,6 +448,26 @@ def _scraped_date(html_data):
     raw = meta.get("date") if isinstance(meta, dict) else getattr(meta, "date", None)
     return _parse_engine_date(raw)
 
+def _looks_like_keyword_spam(text: str) -> bool:
+    """
+    Reject keyword-stuffed SEO blobs (e.g. long tag lists with no real prose).
+    Real prose has sentence punctuation and word repetition; spam has neither.
+    """
+    words = re.findall(r"\w+", text.lower())
+    if len(words) < 30:
+        return False  # too short to judge; let the length gate handle it
+
+    # 1) Almost no sentence-ending punctuation across a long block = not prose.
+    sentence_marks = text.count(".") + text.count("!") + text.count("?")
+    punct_ratio = sentence_marks / len(words)
+
+    # 2) Very high unique-word ratio = a list of distinct keywords, not prose
+    #    (normal English repeats "the", "and", "is", etc.).
+    unique_ratio = len(set(words)) / len(words)
+
+    # Spam if it's long, barely punctuated, AND highly non-repetitive.
+    return punct_ratio < 0.015 and unique_ratio > 0.7
+
 
 def process_and_segment(html_data, record):
     """
@@ -467,7 +491,7 @@ def process_and_segment(html_data, record):
     # sentences[i:i+3] truncate gracefully, so no closing content is dropped.
     for i in range(0, len(sentences), 1):
         chunk = " ".join(sentences[i:i + 3])
-        if len(chunk) > 130:
+        if len(chunk) > 130 and not _looks_like_keyword_spam(chunk):
             segments.append({
                 "url": record["url"],
                 "domain": record["domain"],
@@ -486,9 +510,9 @@ def run_deep_search_retrieval(query: str) -> str:
         return "ERROR: Search layer could not resolve any result links."
 
     raw_pool = []
-    # Concurrent fetch; execute_hardened_fetch is self-contained per URL
-    # (own PoolManager, no shared state), so it is thread-safe. Parsing /
-    # segmentation runs back on the main thread as each fetch completes.
+    attempted = len(records)
+    yielded = 0
+    failed = 0
     with ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as executor:
         future_to_rec = {executor.submit(execute_hardened_fetch, rec["url"]): rec
                          for rec in records}
@@ -499,8 +523,14 @@ def run_deep_search_retrieval(query: str) -> str:
             except Exception as ex:
                 print(f"FETCH WORKER ERROR for '{rec['url']}': "
                       f"{type(ex).__name__}: {ex}", file=sys.stderr)
+                failed += 1
                 continue
-            raw_pool.extend(process_and_segment(html, rec))
+            segs = process_and_segment(html, rec)
+            if segs:
+                yielded += 1
+            else:
+                failed += 1  # fetched but no usable text (timeout/overflow/empty)
+            raw_pool.extend(segs)
 
     if not raw_pool:
         return "ERROR: No usable text content was extracted from result pages."
@@ -589,6 +619,7 @@ def run_deep_search_retrieval(query: str) -> str:
         ratio_line = "- Raw extraction token count unavailable."
 
     final_text += ("\n\n---\n**Token Report**\n"
+                   f"- Fetched {attempted} URLs, {yielded} yielded text, {failed} failed\n"
                    f"- Distinct sources returned: {len(selected)}\n"
                    f"- Output tokens: {distilled_tokens}\n"
                    f"{ratio_line}")
